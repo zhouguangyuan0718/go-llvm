@@ -10,14 +10,17 @@
 extern "C" {
 #endif
 LLVMValueRef LLVMGoGetNamedValue(LLVMModuleRef M, const char *Name, size_t Len);
-LLVMValueRef LLVMGoCloneFunction(LLVMValueRef Fn);
+// Invalid inputs are reported to the Go layer, which raises a Go panic.
+LLVMValueRef LLVMGoCloneFunction(LLVMValueRef Fn); // null on invalid input
 LLVMBool LLVMGoSimplifyInstructionsInBlock(LLVMBasicBlockRef BB);
 LLVMBool LLVMGoConstantFoldTerminator(LLVMBasicBlockRef BB,
                                       LLVMBool DeleteDead);
-LLVMBool LLVMGoRemoveUnreachableBlocks(LLVMValueRef Fn);
-void LLVMGoSetSubprogramLinkageName(LLVMMetadataRef SP, const char *Name,
-                                    size_t Len);
-void LLVMGoSetTailCallKind(LLVMValueRef Call, unsigned Kind);
+// Returns -1 on invalid input, otherwise whether the function changed.
+int LLVMGoRemoveUnreachableBlocks(LLVMValueRef Fn);
+LLVMBool LLVMGoSetSubprogramLinkageName(LLVMMetadataRef SP, const char *Name,
+                                        size_t Len);
+LLVMBool LLVMGoSetTailCallKind(LLVMValueRef Call, unsigned Kind);
+// Returns ~0u on invalid input.
 unsigned LLVMGoGetTailCallKind(LLVMValueRef Call);
 struct LLVMGoInlineAsmInfo {
   LLVMTypeRef Type;

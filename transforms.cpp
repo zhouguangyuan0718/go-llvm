@@ -12,13 +12,21 @@
 #include "llvm/Transforms/Utils/Local.h"
 using namespace llvm;
 
+// Keep the Go TailCallKind constants and the C boundary in sync with LLVM.
+static_assert(CallInst::TCK_None == 0 && CallInst::TCK_Tail == 1 &&
+                  CallInst::TCK_MustTail == 2 && CallInst::TCK_NoTail == 3,
+              "update the Go TailCallKind constants for this LLVM version");
+
 LLVMValueRef LLVMGoGetNamedValue(LLVMModuleRef M, const char *Name,
                                  size_t Len) {
   return wrap(unwrap(M)->getNamedValue(StringRef(Name, Len)));
 }
 LLVMValueRef LLVMGoCloneFunction(LLVMValueRef Fn) {
+  auto *F = Fn ? dyn_cast<Function>(unwrap(Fn)) : nullptr;
+  if (!F)
+    return nullptr;
   ValueToValueMapTy Map;
-  return wrap(CloneFunction(unwrap<Function>(Fn), Map));
+  return wrap(CloneFunction(F, Map));
 }
 LLVMBool LLVMGoSimplifyInstructionsInBlock(LLVMBasicBlockRef BB) {
   return SimplifyInstructionsInBlock(unwrap(BB));
@@ -27,26 +35,40 @@ LLVMBool LLVMGoConstantFoldTerminator(LLVMBasicBlockRef BB,
                                       LLVMBool DeleteDead) {
   return ConstantFoldTerminator(unwrap(BB), DeleteDead);
 }
-LLVMBool LLVMGoRemoveUnreachableBlocks(LLVMValueRef Fn) {
-  return removeUnreachableBlocks(*unwrap<Function>(Fn));
+int LLVMGoRemoveUnreachableBlocks(LLVMValueRef Fn) {
+  auto *F = Fn ? dyn_cast<Function>(unwrap(Fn)) : nullptr;
+  if (!F || F->isDeclaration())
+    return -1;
+  return removeUnreachableBlocks(*F);
 }
-void LLVMGoSetSubprogramLinkageName(LLVMMetadataRef SP, const char *Name,
-                                    size_t Len) {
-  auto *Subprogram = unwrap<DISubprogram>(SP);
+LLVMBool LLVMGoSetSubprogramLinkageName(LLVMMetadataRef SP, const char *Name,
+                                        size_t Len) {
+  auto *Subprogram = SP ? dyn_cast<DISubprogram>(unwrap(SP)) : nullptr;
+  if (!Subprogram)
+    return false;
   Subprogram->replaceLinkageName(
       MDString::get(Subprogram->getContext(), StringRef(Name, Len)));
+  return true;
 }
-void LLVMGoSetTailCallKind(LLVMValueRef Call, unsigned Kind) {
-  unwrap<CallInst>(Call)->setTailCallKind(
-      static_cast<CallInst::TailCallKind>(Kind));
+LLVMBool LLVMGoSetTailCallKind(LLVMValueRef Call, unsigned Kind) {
+  auto *CI = Call ? dyn_cast<CallInst>(unwrap(Call)) : nullptr;
+  if (!CI || Kind > CallInst::TCK_NoTail)
+    return false;
+  CI->setTailCallKind(static_cast<CallInst::TailCallKind>(Kind));
+  return true;
 }
 unsigned LLVMGoGetTailCallKind(LLVMValueRef Call) {
-  return unwrap<CallInst>(Call)->getTailCallKind();
+  auto *CI = Call ? dyn_cast<CallInst>(unwrap(Call)) : nullptr;
+  return CI ? CI->getTailCallKind() : ~0u;
 }
 LLVMGoInlineAsmInfo LLVMGoGetInlineAsmInfo(LLVMValueRef Asm) {
-  auto *A = unwrap<InlineAsm>(Asm);
-  const auto &Text = A->getAsmString();
-  const auto &Constraints = A->getConstraintString();
+  auto *A = Asm ? dyn_cast<InlineAsm>(unwrap(Asm)) : nullptr;
+  if (!A)
+    return {};
+  // Borrow InlineAsm's storage with either the older std::string& API or the
+  // newer StringRef API. Copying a std::string here would return dangling data.
+  StringRef Text = A->getAsmString();
+  StringRef Constraints = A->getConstraintString();
   return {wrap(A->getFunctionType()),
           Text.data(),
           Constraints.data(),

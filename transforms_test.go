@@ -6,10 +6,73 @@ package llvm
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestTransformInvalidInputs(t *testing.T) {
+	// Keep a regression in the C boundary from aborting the entire test suite.
+	const childEnv = "LLVM_TRANSFORM_INVALID_INPUT_CHILD"
+	if os.Getenv(childEnv) != "1" {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestTransformInvalidInputs$")
+		cmd.Env = append(os.Environ(), childEnv+"=1")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("invalid inputs must produce recoverable Go panics: %v\n%s", err, out)
+		}
+		return
+	}
+	mod := transformationModule(t, `
+declare void @external()
+define void @caller() {
+  call void @external()
+  ret void
+}
+`)
+	fn := mod.NamedFunction("caller")
+	call := fn.FirstBasicBlock().FirstInstruction()
+	integer := ConstInt(mod.Context().Int32Type(), 1, false)
+	cases := []struct {
+		name string
+		run  func()
+	}{
+		{"CloneFunction/nil", func() { Value{}.CloneFunction() }},
+		{"CloneFunction/wrong-kind", func() { integer.CloneFunction() }},
+		{"RemoveUnreachableBlocks/nil", func() { Value{}.RemoveUnreachableBlocks() }},
+		{"RemoveUnreachableBlocks/wrong-kind", func() { integer.RemoveUnreachableBlocks() }},
+		{"RemoveUnreachableBlocks/declaration", func() { mod.NamedFunction("external").RemoveUnreachableBlocks() }},
+		{"SetSubprogramLinkageName/nil", func() { Metadata{}.SetSubprogramLinkageName("bad") }},
+		{"SetSubprogramLinkageName/wrong-kind", func() { mod.Context().MDString("x").SetSubprogramLinkageName("bad") }},
+		{"TailCallKind/nil", func() { Value{}.TailCallKind() }},
+		{"TailCallKind/wrong-kind", func() { fn.TailCallKind() }},
+		{"SetTailCallKind/nil", func() { Value{}.SetTailCallKind(TailCallKindTail) }},
+		{"SetTailCallKind/wrong-kind", func() { fn.SetTailCallKind(TailCallKindTail) }},
+		{"SetTailCallKind/invalid-enum", func() { call.SetTailCallKind(TailCallKind(4)) }},
+		{"SetTailCallKind/large-enum", func() { call.SetTailCallKind(^TailCallKind(0)) }},
+		{"InlineAsmInfo/nil", func() { Value{}.InlineAsmInfo() }},
+		{"InlineAsmInfo/wrong-kind", func() { fn.InlineAsmInfo() }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				got := recover()
+				message, ok := got.(string)
+				method, _, _ := strings.Cut(tc.name, "/")
+				if !ok || !strings.Contains(message, method) {
+					t.Errorf("expected descriptive %s panic, got %v", method, got)
+				}
+			}()
+			tc.run()
+		})
+	}
+	if call.TailCallKind() != TailCallKindNone {
+		t.Fatal("invalid tail kind changed the call")
+	}
+	if err := VerifyModule(mod, ReturnStatusAction); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func transformationModule(t *testing.T, source string) Module {
 	t.Helper()
@@ -67,7 +130,8 @@ merge:
 		t.Fatal("clone must own distinct debug information")
 	}
 	clone.Subprogram().SetSubprogramLinkageName("copy")
-	if !strings.Contains(mod.String(), `linkageName: "copy"`) || !strings.Contains(mod.String(), `linkageName: "original"`) {
+	ir := mod.String()
+	if !strings.Contains(ir, `linkageName: "copy"`) || !strings.Contains(ir, `linkageName: "original"`) {
 		t.Fatal("debug linker names are not independent")
 	}
 	clone.Param(1).ReplaceAllUsesWith(ConstInt(mod.Context().Int1Type(), 1, false))
@@ -82,10 +146,11 @@ merge:
 			break
 		}
 	}
-	if original.String() != before || strings.Contains(clone.String(), "fallback") || strings.Contains(clone.String(), "phi ") {
-		t.Fatalf("clone cleanup changed original or retained dead control flow:\n%s", clone.String())
+	cloneIR := clone.String()
+	if original.String() != before || strings.Contains(cloneIR, "fallback") || strings.Contains(cloneIR, "phi ") {
+		t.Fatalf("clone cleanup changed original or retained dead control flow:\n%s", cloneIR)
 	}
-	if !strings.Contains(clone.String(), "@external(") || clone.GetEnumFunctionAttribute(AttributeKindID("noinline")).IsNil() {
+	if !strings.Contains(cloneIR, "@external(") || clone.GetEnumFunctionAttribute(AttributeKindID("noinline")).IsNil() {
 		t.Fatal("external references or attributes were lost")
 	}
 	decl := mod.NamedFunction("external").CloneFunction()
@@ -115,17 +180,25 @@ define i32 @forward(i32 %x) {
 }
 `)
 	call := mod.NamedFunction("forward").FirstBasicBlock().FirstInstruction()
-	for _, kind := range []TailCallKind{TailCallKindTail, TailCallKindNoTail, TailCallKindNone, TailCallKindMustTail} {
-		call.SetTailCallKind(kind)
-		if call.TailCallKind() != kind {
-			t.Fatalf("tail kind did not round trip: %d", kind)
+	for _, tc := range []struct {
+		kind TailCallKind
+		text string
+	}{
+		{TailCallKindTail, "tail call"},
+		{TailCallKindNoTail, "notail call"},
+		{TailCallKindNone, "call"},
+		{TailCallKindMustTail, "musttail call"},
+	} {
+		call.SetTailCallKind(tc.kind)
+		if call.TailCallKind() != tc.kind {
+			t.Fatalf("tail kind did not round trip: %d", tc.kind)
+		}
+		if ir := call.String(); !strings.Contains(ir, " = "+tc.text+" ") {
+			t.Fatalf("tail kind %d has wrong IR semantics: %s", tc.kind, ir)
 		}
 		if err := VerifyModule(mod, ReturnStatusAction); err != nil {
 			t.Fatal(err)
 		}
-	}
-	if !strings.Contains(call.String(), "musttail call") {
-		t.Fatal("musttail was downgraded to an optional hint")
 	}
 }
 
@@ -134,16 +207,41 @@ func TestInlineAsmInfoAndMetadataConversion(t *testing.T) {
 	defer ctx.Dispose()
 	typ := FunctionType(ctx.VoidType(), []Type{ctx.Int32Type()}, false)
 	for _, sideEffects := range []bool{false, true} {
-		asm := InlineAsm(typ, "# marker $0", "r", sideEffects, true, InlineAsmDialectIntel, true)
+		// Long strings exercise owned heap storage in older LLVM's std::string
+		// API; an embedded NUL also checks the length-carrying C boundary.
+		text := strings.Repeat("# marker $0\n", 64) + "\x00suffix"
+		asm := InlineAsm(typ, text, "r", sideEffects, true, InlineAsmDialectIntel, true)
 		info := asm.InlineAsmInfo()
 		rebuilt := InlineAsm(info.Type, info.Assembly, info.Constraints, info.HasSideEffects, info.IsAlignStack, info.Dialect, info.CanThrow)
-		if rebuilt != asm || info.HasSideEffects != sideEffects || !info.IsAlignStack || !info.CanThrow || info.Dialect != InlineAsmDialectIntel {
+		if rebuilt != asm || info.Assembly != text || info.Constraints != "r" || info.HasSideEffects != sideEffects || !info.IsAlignStack || !info.CanThrow || info.Dialect != InlineAsmDialectIntel {
 			t.Fatalf("inline asm properties changed: %+v", info)
 		}
 	}
 	for _, md := range []Metadata{ctx.MDString("name"), ctx.MDNode(nil), ConstInt(ctx.Int32Type(), 7, false).ConstantAsMetadata()} {
 		if ctx.MetadataAsValue(md).AsMetadata() != md {
 			t.Fatal("metadata conversion changed identity")
+		}
+	}
+	mod := ctx.NewModule("metadata-values")
+	defer mod.Dispose()
+	fn := AddFunction(mod, "add", FunctionType(ctx.Int32Type(), []Type{ctx.Int32Type()}, false))
+	b := ctx.NewBuilder()
+	defer b.Dispose()
+	b.SetInsertPointAtEnd(ctx.AddBasicBlock(fn, "entry"))
+	constant := ConstInt(ctx.Int32Type(), 7, false)
+	sum := b.CreateAdd(fn.Param(0), constant, "sum")
+	b.CreateRet(sum)
+	for _, tc := range []struct {
+		value Value
+		kind  MetadataKind
+	}{
+		{constant, ConstantAsMetadataMetadataKind},
+		{fn.Param(0), LocalAsMetadataMetadataKind},
+		{sum, LocalAsMetadataMetadataKind},
+	} {
+		md := tc.value.AsMetadata()
+		if md.Kind() != tc.kind || ctx.MetadataAsValue(md).AsMetadata() != md {
+			t.Fatalf("value metadata kind or identity changed: %s", tc.value.String())
 		}
 	}
 }

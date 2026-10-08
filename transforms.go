@@ -15,8 +15,12 @@ import "unsafe"
 // blocks, instructions and debug information. Local references are remapped;
 // references to other functions and globals remain unchanged. The caller can
 // rename the returned function. The original function is not modified.
+// It panics if v is nil or is not a function; declarations may be cloned.
 func (v Value) CloneFunction() (clone Value) {
 	clone.C = C.LLVMGoCloneFunction(v.C)
+	if clone.IsNil() {
+		panic("llvm: CloneFunction requires a function")
+	}
 	return
 }
 
@@ -34,19 +38,28 @@ func (bb BasicBlock) ConstantFoldTerminator(deleteDead bool) bool {
 
 // RemoveUnreachableBlocks deletes blocks unreachable from the function entry
 // and updates successor PHIs. It returns whether the function changed.
+// It panics if v is nil or is not a function definition.
 func (v Value) RemoveUnreachableBlocks() bool {
-	return C.LLVMGoRemoveUnreachableBlocks(v.C) != 0
+	changed := C.LLVMGoRemoveUnreachableBlocks(v.C)
+	if changed < 0 {
+		panic("llvm: RemoveUnreachableBlocks requires a function definition")
+	}
+	return changed != 0
 }
 
 // SetSubprogramLinkageName changes the linker name of a DISubprogram without
-// changing its source-language display name. md must be a DISubprogram.
+// changing its source-language display name. It panics if md is nil or is not
+// a DISubprogram.
 func (md Metadata) SetSubprogramLinkageName(name string) {
 	text := C.CString(name)
 	defer C.free(unsafe.Pointer(text))
-	C.LLVMGoSetSubprogramLinkageName(md.C, text, C.size_t(len(name)))
+	if C.LLVMGoSetSubprogramLinkageName(md.C, text, C.size_t(len(name))) == 0 {
+		panic("llvm: SetSubprogramLinkageName requires a DISubprogram")
+	}
 }
 
-// AsMetadata converts a constant or MetadataAsValue back into metadata.
+// AsMetadata unwraps a MetadataAsValue, or wraps a constant, argument, or
+// instruction as metadata using LLVMValueAsMetadata.
 func (v Value) AsMetadata() (md Metadata) {
 	md.C = C.LLVMValueAsMetadata(v.C)
 	return
@@ -56,6 +69,7 @@ func (v Value) AsMetadata() (md Metadata) {
 type TailCallKind uint32
 
 const (
+	// These values match llvm::CallInst::TailCallKind, checked in transforms.cpp.
 	TailCallKindNone TailCallKind = iota
 	TailCallKindTail
 	TailCallKindMustTail
@@ -63,14 +77,22 @@ const (
 )
 
 // TailCallKind returns the tail-call kind of a call instruction.
+// It panics if v is nil or is not a call instruction.
 func (v Value) TailCallKind() TailCallKind {
-	return TailCallKind(C.LLVMGoGetTailCallKind(v.C))
+	kind := TailCallKind(C.LLVMGoGetTailCallKind(v.C))
+	if kind > TailCallKindNoTail {
+		panic("llvm: TailCallKind requires a call instruction")
+	}
+	return kind
 }
 
 // SetTailCallKind sets the tail-call kind of a call instruction. The caller must
 // satisfy LLVM's ABI and control-flow requirements for mandatory tail calls.
+// It panics if v is nil, is not a call instruction, or kind is invalid.
 func (v Value) SetTailCallKind(kind TailCallKind) {
-	C.LLVMGoSetTailCallKind(v.C, C.unsigned(kind))
+	if C.LLVMGoSetTailCallKind(v.C, C.unsigned(kind)) == 0 {
+		panic("llvm: SetTailCallKind requires a call instruction and a valid tail-call kind")
+	}
 }
 
 // InlineAsmInfo contains all properties needed to rebuild an inline assembly
@@ -83,8 +105,12 @@ type InlineAsmInfo struct {
 }
 
 // InlineAsmInfo returns the properties of an inline assembly value.
+// It panics if v is nil or is not an inline assembly value.
 func (v Value) InlineAsmInfo() InlineAsmInfo {
 	a := C.LLVMGoGetInlineAsmInfo(v.C)
+	if a.Type == nil {
+		panic("llvm: InlineAsmInfo requires an inline assembly value")
+	}
 	return InlineAsmInfo{
 		Type:           Type{C: a.Type},
 		Assembly:       C.GoStringN(a.Assembly, C.int(a.AssemblyLen)),
